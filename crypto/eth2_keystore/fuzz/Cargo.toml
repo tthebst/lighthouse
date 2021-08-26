@@ -1,0 +1,38 @@
+
+[package]
+name = "eth2_keystore-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aes = { version = "0.7", features = ["ctr"] }
+aes-ctr = "0.6.0"
+hex = "0.4"
+
+[dependencies.eth2_keystore]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "aes_vs_aes_ctr"
+path = "fuzz_targets/aes_vs_aes_ctr.rs"
+test = false
+doc = false
+
+[patch]
+[patch.crates-io]
+tree_hash = { path = "../../../consensus/tree_hash" }
+tree_hash_derive = { path = "../../../consensus/tree_hash_derive" }
+eth2_ssz = { path = "../../../consensus/ssz" }
+eth2_ssz_derive = { path = "../../../consensus/ssz_derive" }
+eth2_ssz_types = { path = "../../../consensus/ssz_types" }
+eth2_hashing = { path = "../../eth2_hashing" }
