@@ -1,0 +1,3 @@
+[submodule "crypto/eth2_keystore/block-ciphers"]
+	path = crypto/eth2_keystore/block-ciphers
+	url = https://github.com/RustCrypto/block-ciphers.git
