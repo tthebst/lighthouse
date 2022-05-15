@@ -2,6 +2,8 @@
 //! required for the HTTP API.
 
 use crate::Error as ServerError;
+use actix_web::http::header::{from_comma_delimited, Accept as ActixAccept};
+use http::HeaderValue;
 use lighthouse_network::{ConnectionDirection, Enr, Multiaddr, PeerConnectionStatus};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -1008,12 +1010,25 @@ impl FromStr for Accept {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "application/octet-stream" => Ok(Accept::Ssz),
-            "application/json" => Ok(Accept::Json),
-            "*/*" => Ok(Accept::Any),
-            _ => Err("accept header cannot be parsed.".to_string()),
+        let accept_header =
+            HeaderValue::from_str(s).map_err(|_| "accept header cannot be parsed.".to_string())?;
+        let mimes = ActixAccept(
+            from_comma_delimited(vec![accept_header].iter())
+                .map_err(|_| "accept header cannot be parsed.".to_string())?,
+        );
+
+        println!("Parsed accept {:?}", mimes);
+
+        for mime in mimes.ranked() {
+            // Direct mime matching not possible because of missing traits. https://github.com/hyperium/mime/issues/134
+            match (mime.type_(), mime.subtype()) {
+                (mime::APPLICATION, mime::OCTET_STREAM) => return Ok(Accept::Ssz),
+                (mime::APPLICATION, mime::JSON) => return Ok(Accept::Json),
+                (mime::STAR, mime::STAR) => return Ok(Accept::Any),
+                _ => continue,
+            };
         }
+        Err("accept header cannot be parsed.".to_string())
     }
 }
 
