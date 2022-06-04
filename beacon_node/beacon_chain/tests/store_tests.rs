@@ -1,4 +1,4 @@
-#![cfg(not(debug_assertions))]
+// #![cfg(not(debug_assertions))]
 
 use beacon_chain::attestation_verification::Error as AttnError;
 use beacon_chain::builder::BeaconChainBuilder;

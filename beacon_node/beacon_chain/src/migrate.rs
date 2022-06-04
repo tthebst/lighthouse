@@ -3,6 +3,7 @@ use crate::errors::BeaconChainError;
 use crate::head_tracker::{HeadTracker, SszHeadTracker};
 use crate::persisted_beacon_chain::{PersistedBeaconChain, DUMMY_CANONICAL_HEAD_BLOCK_ROOT};
 use parking_lot::Mutex;
+use rayon::ThreadPool;
 use slog::{debug, error, info, warn, Logger};
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -29,8 +30,7 @@ const COMPACTION_FINALITY_DISTANCE: u64 = 1024;
 /// to the cold database.
 pub struct BackgroundMigrator<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> {
     db: Arc<HotColdDB<E, Hot, Cold>>,
-    #[allow(clippy::type_complexity)]
-    tx_thread: Option<Mutex<(mpsc::Sender<Notification>, thread::JoinHandle<()>)>>,
+    worker_thread: Option<ThreadPool>,
     /// Genesis block root, for persisting the `PersistedBeaconChain`.
     genesis_block_root: Hash256,
     log: Logger,
@@ -93,14 +93,19 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
         genesis_block_root: Hash256,
         log: Logger,
     ) -> Self {
-        let tx_thread = if config.blocking {
+        let worker_thread = if config.blocking {
             None
         } else {
-            Some(Mutex::new(Self::spawn_thread(db.clone(), log.clone())))
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            )
         };
         Self {
             db,
-            tx_thread,
+            worker_thread,
             genesis_block_root,
             log,
         }
@@ -158,29 +163,18 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
     #[must_use = "Message is not processed when this function returns `Some`"]
     fn send_background_notification(&self, notif: Notification) -> Option<Notification> {
         // Async path, on the background thread.
-        if let Some(tx_thread) = &self.tx_thread {
-            let (ref mut tx, ref mut thread) = *tx_thread.lock();
-
-            // Restart the background thread if it has crashed.
-            if let Err(tx_err) = tx.send(notif) {
-                let (new_tx, new_thread) = Self::spawn_thread(self.db.clone(), self.log.clone());
-
-                *tx = new_tx;
-                let old_thread = mem::replace(thread, new_thread);
-
-                // Join the old thread, which will probably have panicked, or may have
-                // halted normally just now as a result of us dropping the old `mpsc::Sender`.
-                if let Err(thread_err) = old_thread.join() {
-                    warn!(
-                        self.log,
-                        "Migration thread died, so it was restarted";
-                        "reason" => format!("{:?}", thread_err)
-                    );
+        let db = self.db.clone();
+        let log = self.log.clone();
+        if let Some(worker_thread) = &self.worker_thread {
+            match notif {
+                Notification::Reconstruction => {
+                    worker_thread.spawn_fifo(move || Self::run_reconstruction(db, &log))
                 }
-
-                // Retry at most once, we could recurse but that would risk overflowing the stack.
-                let _ = tx.send(tx_err.0);
+                Notification::Finalization(fin) => {
+                    worker_thread.spawn_fifo(move || Self::run_migration(db, fin, &log))
+                }
             }
+
             None
         // Synchronous path, on the current thread.
         } else {
