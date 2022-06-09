@@ -3,7 +3,6 @@ use crate::errors::BeaconChainError;
 use crate::head_tracker::{HeadTracker, SszHeadTracker};
 use crate::persisted_beacon_chain::{PersistedBeaconChain, DUMMY_CANONICAL_HEAD_BLOCK_ROOT};
 use parking_lot::Mutex;
-use rayon::ThreadPool;
 use slog::{debug, error, info, warn, Logger};
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -30,7 +29,8 @@ const COMPACTION_FINALITY_DISTANCE: u64 = 1024;
 /// to the cold database.
 pub struct BackgroundMigrator<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> {
     db: Arc<HotColdDB<E, Hot, Cold>>,
-    worker_thread: Option<ThreadPool>,
+    #[allow(clippy::type_complexity)]
+    tx_thread: Option<Mutex<(mpsc::Sender<Notification>, thread::JoinHandle<()>)>>,
     /// Genesis block root, for persisting the `PersistedBeaconChain`.
     genesis_block_root: Hash256,
     log: Logger,
@@ -55,7 +55,13 @@ pub enum PruningOutcome {
     Successful {
         old_finalized_checkpoint: Checkpoint,
     },
-    DeferredConcurrentMutation,
+    /// The run was aborted because the new finalized checkpoint is older than the previous one.
+    OutOfOrderFinalization {
+        old_finalized_checkpoint: Checkpoint,
+        new_finalized_checkpoint: Checkpoint,
+    },
+    /// The run was aborted due to a concurrent mutation of the head tracker.
+    DeferredConcurrentHeadTrackerMutation,
 }
 
 /// Logic errors that can occur during pruning, none of these should ever happen.
@@ -67,6 +73,10 @@ pub enum PruningError {
     },
     MissingInfoForCanonicalChain {
         slot: Slot,
+    },
+    FinalizedStateOutOfOrder {
+        old_finalized_checkpoint: Checkpoint,
+        new_finalized_checkpoint: Checkpoint,
     },
     UnexpectedEqualStateRoots,
     UnexpectedUnequalStateRoots,
@@ -93,19 +103,14 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
         genesis_block_root: Hash256,
         log: Logger,
     ) -> Self {
-        let worker_thread = if config.blocking {
+        let tx_thread = if config.blocking {
             None
         } else {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap(),
-            )
+            Some(Mutex::new(Self::spawn_thread(db.clone(), log.clone())))
         };
         Self {
             db,
-            worker_thread,
+            tx_thread,
             genesis_block_root,
             log,
         }
@@ -163,18 +168,29 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
     #[must_use = "Message is not processed when this function returns `Some`"]
     fn send_background_notification(&self, notif: Notification) -> Option<Notification> {
         // Async path, on the background thread.
-        let db = self.db.clone();
-        let log = self.log.clone();
-        if let Some(worker_thread) = &self.worker_thread {
-            match notif {
-                Notification::Reconstruction => {
-                    worker_thread.spawn_fifo(move || Self::run_reconstruction(db, &log))
-                }
-                Notification::Finalization(fin) => {
-                    worker_thread.spawn_fifo(move || Self::run_migration(db, fin, &log))
-                }
-            }
+        if let Some(tx_thread) = &self.tx_thread {
+            let (ref mut tx, ref mut thread) = *tx_thread.lock();
 
+            // Restart the background thread if it has crashed.
+            if let Err(tx_err) = tx.send(notif) {
+                let (new_tx, new_thread) = Self::spawn_thread(self.db.clone(), self.log.clone());
+
+                *tx = new_tx;
+                let old_thread = mem::replace(thread, new_thread);
+
+                // Join the old thread, which will probably have panicked, or may have
+                // halted normally just now as a result of us dropping the old `mpsc::Sender`.
+                if let Err(thread_err) = old_thread.join() {
+                    warn!(
+                        self.log,
+                        "Migration thread died, so it was restarted";
+                        "reason" => format!("{:?}", thread_err)
+                    );
+                }
+
+                // Retry at most once, we could recurse but that would risk overflowing the stack.
+                let _ = tx.send(tx_err.0);
+            }
             None
         // Synchronous path, on the current thread.
         } else {
@@ -217,7 +233,7 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
             Ok(PruningOutcome::Successful {
                 old_finalized_checkpoint,
             }) => old_finalized_checkpoint,
-            Ok(PruningOutcome::DeferredConcurrentMutation) => {
+            Ok(PruningOutcome::DeferredConcurrentHeadTrackerMutation) => {
                 warn!(
                     log,
                     "Pruning deferred because of a concurrent mutation";
@@ -225,8 +241,21 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
                 );
                 return;
             }
+            Ok(PruningOutcome::OutOfOrderFinalization {
+                old_finalized_checkpoint,
+                new_finalized_checkpoint,
+            }) => {
+                warn!(
+                    log,
+                    "Ignoring out of order finalization request";
+                    "old_finalized_epoch" => old_finalized_checkpoint.epoch,
+                    "new_finalized_epoch" => new_finalized_checkpoint.epoch,
+                    "message" => "this is expected occasionally due to a (harmless) race condition"
+                );
+                return;
+            }
             Err(e) => {
-                warn!(log, "Block pruning failed"; "error" => format!("{:?}", e));
+                warn!(log, "Block pruning failed"; "error" => ?e);
                 return;
             }
         };
@@ -272,27 +301,30 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
     ) -> (mpsc::Sender<Notification>, thread::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel();
         let thread = thread::spawn(move || {
+            // Worker threadpool. Only 1 thread to limit concurrency.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+
             while let Ok(notif) = rx.recv() {
                 // Read the rest of the messages in the channel, preferring any reconstruction
                 // notification, or the finalization notification with the greatest finalized epoch.
-                let notif =
-                    rx.try_iter()
-                        .fold(notif, |best, other: Notification| match (&best, &other) {
-                            (Notification::Reconstruction, _)
-                            | (_, Notification::Reconstruction) => Notification::Reconstruction,
-                            (
-                                Notification::Finalization(fin1),
-                                Notification::Finalization(fin2),
-                            ) => {
-                                if fin2.finalized_checkpoint.epoch > fin1.finalized_checkpoint.epoch
-                                {
-                                    other
-                                } else {
-                                    best
-                                }
-                            }
-                        });
 
+                let queue = rx.try_iter();
+                let reconstruction_notif =
+                    queue.find(|n| matches!(n, Notification::Reconstruction));
+                let migrate_notif = queue
+                    .filter_map(|n| match notif {
+                        // should not be present anymore
+                        Notification::Reconstruction => None,
+                        Notification::Finalization(f) => Some(f),
+                    })
+                    .max_by_key(|f| f.finalized_checkpoint.epoch);
+                pool.join(
+                    || reconstruction_notif.ok_or  Self::run_reconstruction(db.clone(), &log),
+                    || Self::run_migration(db.clone(), fin, &log),
+                );
                 match notif {
                     Notification::Reconstruction => Self::run_reconstruction(db.clone(), &log),
                     Notification::Finalization(fin) => Self::run_migration(db.clone(), fin, &log),
@@ -339,6 +371,16 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
                 new_finalized_slot,
             }
             .into());
+        }
+
+        // The new finalized state must be newer than the previous finalized state.
+        // I think this can happen sometimes currently due to `fork_choice` running in parallel
+        // with itself and sending us notifications out of order.
+        if old_finalized_slot > new_finalized_slot {
+            return Ok(PruningOutcome::OutOfOrderFinalization {
+                old_finalized_checkpoint,
+                new_finalized_checkpoint,
+            });
         }
 
         debug!(
@@ -517,7 +559,7 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
         // later.
         for head_hash in &abandoned_heads {
             if !head_tracker_lock.contains_key(head_hash) {
-                return Ok(PruningOutcome::DeferredConcurrentMutation);
+                return Ok(PruningOutcome::DeferredConcurrentHeadTrackerMutation);
             }
         }
 

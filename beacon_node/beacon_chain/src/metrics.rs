@@ -922,6 +922,31 @@ lazy_static! {
             "beacon_pre_finalization_block_lookup_count",
             "Number of block roots subject to single block lookups"
         );
+
+    /*
+     * Background Migrate metrics
+     */
+    pub static ref BEACON_STATE_RECONSTRUCTIONS: Result<IntCounter> = try_create_int_counter(
+        "beacon_state_reconstructions",
+        "Number of state reconstructions triggered.",
+    );
+    pub static ref BEACON_STATE_RECONSTRUCTIONS_TIME: Result<Histogram> = try_create_histogram(
+        "beacon_state_reconstructions_time",
+        "State reconstruction execution time.",
+    );
+    pub static ref BEACON_STATE_FREEZER_MIGRATION: Result<IntCounter> = try_create_int_counter(
+        "beacon_state_freezer_migration",
+        "Number of state migration to freezer DB.",
+    );
+    pub static ref BEACON_STATE_FREEZER_MIGRATION_TIME: Result<Histogram> = try_create_histogram(
+        "beacon_state_freezer_migration_time",
+        "State migration to freezer DB time distribution.",
+    );
+    pub static ref BEACON_STATE_FREEZER_MIGRATION_QUEUE: Result<IntGauge> =
+        try_create_int_gauge(
+            "beacon_state_freezer_migration_queue",
+            "Number of finalized states in migration queue."
+        );
 }
 
 /// Scrape the `beacon_chain` for metrics that are not constantly updated (e.g., the present slot,
