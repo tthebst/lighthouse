@@ -287,6 +287,8 @@ version = "0.2.0"
 dependencies = [
  "bitvec 0.20.4",
  "bls",
+ "crossbeam-channel",
+ "crossbeam-deque",
  "derivative",
  "environment",
  "eth1",

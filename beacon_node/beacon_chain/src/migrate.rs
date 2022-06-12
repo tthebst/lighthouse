@@ -1,12 +1,13 @@
 use crate::beacon_chain::BEACON_CHAIN_DB_KEY;
 use crate::errors::BeaconChainError;
 use crate::head_tracker::{HeadTracker, SszHeadTracker};
+use crate::metrics;
 use crate::persisted_beacon_chain::{PersistedBeaconChain, DUMMY_CANONICAL_HEAD_BLOCK_ROOT};
 use parking_lot::Mutex;
 use slog::{debug, error, info, warn, Logger};
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::hot_cold_store::{migrate_database, HotColdDBError};
@@ -30,7 +31,12 @@ const COMPACTION_FINALITY_DISTANCE: u64 = 1024;
 pub struct BackgroundMigrator<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> {
     db: Arc<HotColdDB<E, Hot, Cold>>,
     #[allow(clippy::type_complexity)]
-    tx_thread: Option<Mutex<(mpsc::Sender<Notification>, thread::JoinHandle<()>)>>,
+    tx_thread: Option<
+        Mutex<(
+            crossbeam_channel::Sender<Notification>,
+            thread::JoinHandle<()>,
+        )>,
+    >,
     /// Genesis block root, for persisting the `PersistedBeaconChain`.
     genesis_block_root: Hash256,
     log: Logger,
@@ -83,11 +89,13 @@ pub enum PruningError {
 }
 
 /// Message sent to the migration thread containing the information it needs to run.
+#[derive(Debug, Clone)]
 pub enum Notification {
     Finalization(FinalizationNotification),
     Reconstruction,
 }
 
+#[derive(Debug, Clone)]
 pub struct FinalizationNotification {
     finalized_state_root: BeaconStateHash,
     finalized_checkpoint: Checkpoint,
@@ -298,36 +306,85 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
     fn spawn_thread(
         db: Arc<HotColdDB<E, Hot, Cold>>,
         log: Logger,
-    ) -> (mpsc::Sender<Notification>, thread::JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel();
+    ) -> (
+        crossbeam_channel::Sender<Notification>,
+        thread::JoinHandle<()>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tx_reconstruct = tx.clone();
         let thread = thread::spawn(move || {
-            // Worker threadpool. Only 1 thread to limit concurrency.
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .unwrap();
+            let mut sel = crossbeam_channel::Select::new();
+            sel.recv(&rx);
 
-            while let Ok(notif) = rx.recv() {
-                // Read the rest of the messages in the channel, preferring any reconstruction
-                // notification, or the finalization notification with the greatest finalized epoch.
+            loop {
+                // Block until sth is in queue
+                let queue_size = sel.ready();
+                metrics::set_gauge(
+                    &metrics::BEACON_STATE_FREEZER_MIGRATION_QUEUE,
+                    queue_size as i64,
+                );
+                // Optimize this. I think we don't need clone here. Some borrow checker issue.
+                let queue: Vec<Notification> = rx.try_iter().collect();
 
-                let queue = rx.try_iter();
-                let reconstruction_notif =
-                    queue.find(|n| matches!(n, Notification::Reconstruction));
+                info!(
+                    log,
+                    "QUEUE FINDINGS";
+                    "queue" => ?queue.clone(),
+                );
+                let reconstruction_notif = queue
+                    .clone()
+                    .into_iter()
+                    .find(|n| matches!(n, Notification::Reconstruction));
                 let migrate_notif = queue
-                    .filter_map(|n| match notif {
+                    .into_iter()
+                    .filter_map(|n| match n {
                         // should not be present anymore
                         Notification::Reconstruction => None,
                         Notification::Finalization(f) => Some(f),
                     })
                     .max_by_key(|f| f.finalized_checkpoint.epoch);
-                pool.join(
-                    || reconstruction_notif.ok_or  Self::run_reconstruction(db.clone(), &log),
-                    || Self::run_migration(db.clone(), fin, &log),
+                info!(
+                    log,
+                    "QUEUE FINDINGS";
+                    "migrate" => ?migrate_notif,
                 );
-                match notif {
-                    Notification::Reconstruction => Self::run_reconstruction(db.clone(), &log),
-                    Notification::Finalization(fin) => Self::run_migration(db.clone(), fin, &log),
+                info!(
+                    log,
+                    "QUEUE FINDINGS";
+                    "reconstruction" => ?reconstruction_notif,
+                );
+                if let Some(_) = reconstruction_notif {
+                    metrics::inc_counter(&metrics::BEACON_STATE_RECONSTRUCTIONS);
+                    let t = metrics::start_timer(&metrics::BEACON_STATE_RECONSTRUCTIONS_TIME);
+                    match db.reconstruct_historic_states() {
+                        Err(Error::StateReconstructionDidNotComplete) => {
+                            // Handle send error
+                            let _ = tx_reconstruct.send(Notification::Reconstruction);
+                        }
+                        Err(Error::VectorChunkError(e)) => {
+                            error!(
+                                log,
+                                "State reconstruction failed";
+                                "error" => ?e,
+                            );
+                            let _ = tx_reconstruct.send(Notification::Reconstruction);
+                        }
+                        Err(e) => {
+                            error!(
+                                log,
+                                "State reconstruction failed";
+                                "error" => ?e,
+                            );
+                        }
+                        _ => (),
+                    }
+                    metrics::stop_timer(t);
+                }
+                if let Some(n) = migrate_notif {
+                    metrics::inc_counter(&metrics::BEACON_STATE_FREEZER_MIGRATION);
+                    let t = metrics::start_timer(&metrics::BEACON_STATE_FREEZER_MIGRATION_TIME);
+                    Self::run_migration(db.clone(), n, &log);
+                    metrics::stop_timer(t);
                 }
             }
         });
