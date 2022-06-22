@@ -39,10 +39,10 @@ pub fn get_config<E: EthSpec>(
     if client_config.data_dir.exists() && cli_args.is_present("purge-db") {
         // Remove the chain_db.
         let chain_db = client_config.get_db_path();
-        if chain_db.exists() {
-            fs::remove_dir_all(chain_db)
-                .map_err(|err| format!("Failed to remove chain_db: {}", err))?;
-        }
+        // if chain_db.exists() {
+        //     fs::remove_dir_all(chain_db)
+        //         .map_err(|err| format!("Failed to remove chain_db: {}", err))?;
+        // }
 
         // Remove the freezer db.
         let freezer_db = client_config.get_freezer_db_path();

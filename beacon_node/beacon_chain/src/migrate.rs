@@ -31,15 +31,15 @@ const COMPACTION_FINALITY_DISTANCE: u64 = 1024;
 pub struct BackgroundMigrator<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> {
     db: Arc<HotColdDB<E, Hot, Cold>>,
     #[allow(clippy::type_complexity)]
-    tx_thread: Option<
-        Mutex<(
-            crossbeam_channel::Sender<Notification>,
-            thread::JoinHandle<()>,
-        )>,
-    >,
+    worker: Option<Mutex<BackgroundMigratorWorker>>,
     /// Genesis block root, for persisting the `PersistedBeaconChain`.
     genesis_block_root: Hash256,
     log: Logger,
+}
+
+struct BackgroundMigratorWorker {
+    threadpool: rayon::ThreadPool,
+    tx: crossbeam_channel::Sender<Notification>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -101,6 +101,86 @@ pub struct FinalizationNotification {
     finalized_checkpoint: Checkpoint,
     head_tracker: Arc<HeadTracker>,
     genesis_block_root: Hash256,
+}
+
+impl BackgroundMigratorWorker {
+    fn start(db: Arc<HotColdDB<E, Hot, Cold>>) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tp = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        tp.spawn(Self::run(db, rx))
+    }
+
+    fn run(db: Arc<HotColdDB<E, Hot, Cold>>, x: crossbeam_channel::Receiver) {
+        let mut sel = crossbeam_channel::Select::new();
+        sel.recv(&rx);
+
+        loop {
+            // Block until sth is in queue
+            let queue_size = sel.ready();
+            metrics::set_gauge(
+                &metrics::BEACON_STATE_FREEZER_MIGRATION_QUEUE,
+                queue_size as i64,
+            );
+            let queue: Vec<Notification> = rx.try_iter().collect();
+            let reconstruction_notif = queue
+                .iter()
+                .find(|n| matches!(n, Notification::Reconstruction));
+            let migrate_notif = queue
+                .iter()
+                .filter_map(|n| match n {
+                    // should not be present anymore
+                    Notification::Reconstruction => None,
+                    Notification::Finalization(f) => Some(f),
+                })
+                .max_by_key(|f| f.finalized_checkpoint.epoch);
+            info!(
+                log,
+                "QUEUE FINDINGS";
+                "migrate" => ?migrate_notif,
+            );
+            info!(
+                log,
+                "QUEUE FINDINGS";
+                "reconstruction" => ?reconstruction_notif,
+            );
+            if let Some(_) = reconstruction_notif {
+                metrics::inc_counter(&metrics::BEACON_STATE_RECONSTRUCTIONS);
+                let t = metrics::start_timer(&metrics::BEACON_STATE_RECONSTRUCTIONS_TIME);
+                match db.reconstruct_historic_states() {
+                    Err(Error::StateReconstructionDidNotComplete) => {
+                        // Handle send error
+                        let _ = tx_reconstruct.send(Notification::Reconstruction);
+                    }
+                    Err(Error::VectorChunkError(e)) => {
+                        error!(
+                            log,
+                            "State reconstruction failed";
+                            "error" => ?e,
+                        );
+                        let _ = tx_reconstruct.send(Notification::Reconstruction);
+                    }
+                    Err(e) => {
+                        error!(
+                            log,
+                            "State reconstruction failed";
+                            "error" => ?e,
+                        );
+                    }
+                    _ => (),
+                }
+                metrics::stop_timer(t);
+            }
+            if let Some(n) = migrate_notif {
+                metrics::inc_counter(&metrics::BEACON_STATE_FREEZER_MIGRATION);
+                let t = metrics::start_timer(&metrics::BEACON_STATE_FREEZER_MIGRATION_TIME);
+                Self::run_migration(db.clone(), n.clone(), &log);
+                metrics::stop_timer(t);
+            }
+        }
+    }
 }
 
 impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Hot, Cold> {
@@ -323,20 +403,12 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
                     &metrics::BEACON_STATE_FREEZER_MIGRATION_QUEUE,
                     queue_size as i64,
                 );
-                // Optimize this. I think we don't need clone here. Some borrow checker issue.
                 let queue: Vec<Notification> = rx.try_iter().collect();
-
-                info!(
-                    log,
-                    "QUEUE FINDINGS";
-                    "queue" => ?queue.clone(),
-                );
                 let reconstruction_notif = queue
-                    .clone()
-                    .into_iter()
+                    .iter()
                     .find(|n| matches!(n, Notification::Reconstruction));
                 let migrate_notif = queue
-                    .into_iter()
+                    .iter()
                     .filter_map(|n| match n {
                         // should not be present anymore
                         Notification::Reconstruction => None,
@@ -383,7 +455,7 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> BackgroundMigrator<E, Ho
                 if let Some(n) = migrate_notif {
                     metrics::inc_counter(&metrics::BEACON_STATE_FREEZER_MIGRATION);
                     let t = metrics::start_timer(&metrics::BEACON_STATE_FREEZER_MIGRATION_TIME);
-                    Self::run_migration(db.clone(), n, &log);
+                    Self::run_migration(db.clone(), n.clone(), &log);
                     metrics::stop_timer(t);
                 }
             }
