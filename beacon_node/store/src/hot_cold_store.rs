@@ -892,6 +892,11 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> HotColdDB<E, Hot, Cold> 
         // See the comments in `get_historic_state_limits` for more information.
         let (lower_limit, upper_limit) = self.get_historic_state_limits();
 
+        info!(
+            self.log,
+            "Load cold state";
+            "limits" => format!("lower {} upper {} ",lower_limit,upper_limit),
+        );
         if slot <= lower_limit || slot >= upper_limit {
             if slot % self.config.slots_per_restore_point == 0 {
                 let restore_point_idx = slot.as_u64() / self.config.slots_per_restore_point;
@@ -913,12 +918,37 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> HotColdDB<E, Hot, Cold> 
             .ok_or(HotColdDBError::MissingRestorePoint(*state_root))?;
         let mut partial_state: PartialBeaconState<E> =
             PartialBeaconState::from_ssz_bytes(&partial_state_bytes, &self.spec)?;
+        info!(
+            self.log,
+            "Rstore point";
+            "partialstate" => format!("{:?}",partial_state),
+        );
 
         // Fill in the fields of the partial state.
         partial_state.load_block_roots(&self.cold_db, &self.spec)?;
+        info!(
+            self.log,
+            "Rstore point";
+            "loaded blcokroots" => true,
+        );
         partial_state.load_state_roots(&self.cold_db, &self.spec)?;
+        info!(
+            self.log,
+            "Rstore point";
+            "loaded stateroots" => true,
+        );
         partial_state.load_historical_roots(&self.cold_db, &self.spec)?;
+        info!(
+            self.log,
+            "Rstore point";
+            "loaded roots" => true,
+        );
         partial_state.load_randao_mixes(&self.cold_db, &self.spec)?;
+        info!(
+            self.log,
+            "Rstore point";
+            "loaded randao" => true,
+        );
 
         partial_state.try_into()
     }
